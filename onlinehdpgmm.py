@@ -10,6 +10,8 @@ from corpus import document, corpus
 from itertools import izip
 import random
 
+from scipy.special import digamma as _digamma, gammaln as _gammaln
+
 meanchangethresh = 0.00001
 random_seed = 999931111
 np.random.seed(random_seed)
@@ -18,6 +20,9 @@ min_adding_noise_point = 10
 min_adding_noise_ratio = 1 
 mu0 = 0.3
 rhot_bound = 0.0
+
+def digamma(x):
+    return _digamma(x + np.finfo(np.float32).eps)
 
 def dirichlet_expectation(alpha):
     """
@@ -41,19 +46,36 @@ def expect_log_sticks(sticks):
     Elogsticks[1:] = Elogsticks[1:] + np.cumsum(Elog1_W)
     return Elogsticks 
 
+
+def _bound_state_log_lik(X, initial_bound, precs, means):
+    """Update the bound with likelihood terms, for standard covariance types"""
+    n_components, n_features = means.shape
+    n_samples = X.shape[0]
+    bound = np.empty((n_samples, n_components))
+    bound[:] = initial_bound
+    for k in range(n_components):
+        d = X - means[k]
+        bound[:, k] -= 0.5 * np.sum(d * d * precs[k], axis=1)
+    return bound
+
 class suff_stats:
     def __init__(self, T, Wt, Dt):
         self.m_batchsize = Dt
         self.m_var_sticks_ss = np.zeros(T) 
         self.m_var_beta_ss = np.zeros((T, Wt))
+        # Wt is the vector's dimension
+        self.m_var_mean_ss = np.zeros((T, Wt))
+        # TODO: prarameters for update precise
+        self.
     
     def set_zero(self):
         self.m_var_sticks_ss.fill(0.0)
         self.m_var_beta_ss.fill(0.0)
+        self.m_var_mean_ss.fill(0.0)
 
 class online_hdp:
     ''' hdp model using stick breaking'''
-    def __init__(self, T, K, D, W, eta, alpha, gamma, kappa, tau, scale=1.0, adding_noise=False):
+    def __init__(self, T, K, D, W, eta, alpha, gamma, kappa, tau, dim = 500, scale=1.0, adding_noise=False):
         """
         this follows the convention of the HDP paper
         gamma: first level concentration
@@ -89,6 +111,15 @@ class online_hdp:
         self.m_eta = eta
         ## topic * word
         self.m_Elogbeta = dirichlet_expectation(self.m_eta + self.m_lambda)
+
+
+        ## start
+        self.m_dim = dim # the vector dimension
+        self.m_means = np.random.uniform(0.000001, 10, (self.m_T - 1, self.m_dim))
+        self.m_dof = np.ones(self.m_T - 1)
+        self.m_scale = np.ones(self.m_T - 1)
+        self.m_precs = np.ones((self.m_T, self.m_dim))
+        self.bound_prec = 0.5 * self.m_T * (digamma(self.m_dof) - np.log(self.m_scale))
 
         self.m_tau = tau + 1
         self.m_kappa = kappa
@@ -134,32 +165,8 @@ class online_hdp:
 
         self.m_lambda_sum = np.sum(self.m_lambda, axis=1)
 
-    def process_documents(self, docs, var_converge, unseen_ids=[], update=True, opt_o=True):
-        # Find the unique words in this mini-batch of documents...
-        self.m_num_docs_parsed += len(docs)
-        adding_noise = False
-        adding_noise_point = min_adding_noise_point
+    def process_documents(self, docs, var_converge, unseen_ids=[], ropt_o=True):
 
-        if self.m_adding_noise:
-            if float(adding_noise_point) / len(docs) < min_adding_noise_ratio:
-                adding_noise_point = min_adding_noise_ratio * len(docs)
-
-            if self.m_num_docs_parsed % adding_noise_point == 0:
-                adding_noise = True
-
-        unique_words = dict()
-        word_list = []
-        if adding_noise:
-          word_list = range(self.m_W)
-          for w in word_list:
-            unique_words[w] = w
-        else:
-            for doc in docs:
-                for w in doc.words:
-                    if w not in unique_words:
-                        unique_words[w] = len(unique_words)
-                        word_list.append(w)
-        Wt = len(word_list) # length of words in these documents
 
         # ...and do the lazy updates on the necessary columns of lambda
         rw = np.array([self.m_r[t] for t in self.m_timestamp[word_list]])
@@ -177,31 +184,12 @@ class online_hdp:
         count = 0
         unseen_score = 0.0
         unseen_count = 0
-        for i, doc in enumerate(docs):
-            doc_score = self.doc_e_step(doc, ss, Elogsticks_1st, \
-                        word_list, unique_words, var_converge)
-            count += doc.total
-            score += doc_score
-            if i in unseen_ids:
-              unseen_score += doc_score
-              unseen_count += doc.total
 
-        if adding_noise:
-            # add noise to the ss
-            print "adding noise at this stage..."
+        for i, cop in enumerate(cops):
+            cop_score = self.doc_e_step(cop, ss, Elogsticks_1st, var_converge)
 
-            ## old noise
-            noise = np.random.gamma(1.0, 1.0, ss.m_var_beta_ss.shape)
-            noise_sum = np.sum(noise, axis=1)
-            ratio = np.sum(ss.m_var_beta_ss, axis=1) / noise_sum
-            noise =  noise * ratio[:,np.newaxis]
-
-            mu = mu0 *1000.0 / (self.m_updatect + 1000)
-
-            ss.m_var_beta_ss = ss.m_var_beta_ss * (1.0-mu) + noise * mu 
-       
-        if update:
-            self.update_lambda(ss, word_list, opt_o)
+        #self.update_lambda(ss, word_list, opt_o)
+        self.update_model(ss)
     
         return (score, count, unseen_score, unseen_count) 
 
@@ -215,16 +203,14 @@ class online_hdp:
         self.m_lambda_sum = self.m_lambda_sum[idx]
         self.m_Elogbeta = self.m_Elogbeta[idx,:]
 
-    def doc_e_step(self, doc, ss, Elogsticks_1st, \
+    def doc_e_step(self, cop, ss, Elogsticks_1st, \
                    word_list, unique_words, var_converge, \
                    max_iter=100):
         """
         e step for a single doc
         """
 
-        batchids = [unique_words[id] for id in doc.words]
-
-        Elogbeta_doc = self.m_Elogbeta[:, doc.words] 
+        ## Elogbeta_doc = self.m_Elogbeta[:, doc.words] 
         ## very similar to the hdp equations
         v = np.zeros((2, self.m_K-1))  
         v[0] = 1.0
@@ -234,7 +220,7 @@ class online_hdp:
         Elogsticks_2nd = expect_log_sticks(v)
 
         # back to the uniform
-        phi = np.ones((len(doc.words), self.m_K)) * 1.0/self.m_K
+        phi = np.ones((cop.shape[0], self.m_K)) * 1.0/self.m_K
 
         likelihood = 0.0
         old_likelihood = -1e100
@@ -246,27 +232,29 @@ class online_hdp:
         while iter < max_iter and (converge < 0.0 or converge > var_converge):
             ### update variational parameters
             # var_phi 
+            Eloggauss = expect_log_gauss(cop)
             if iter < 3:
-                var_phi = np.dot(phi.T,  (Elogbeta_doc * doc.counts).T)
+                var_phi = np.dot(phi.T, Eloggauss)
                 (log_var_phi, log_norm) = utils.log_normalize(var_phi)
                 var_phi = np.exp(log_var_phi)
             else:
-                var_phi = np.dot(phi.T,  (Elogbeta_doc * doc.counts).T) + Elogsticks_1st
+                var_phi = np.dot(phi.T,  Eloggauss) + Elogsticks_1st
                 (log_var_phi, log_norm) = utils.log_normalize(var_phi)
                 var_phi = np.exp(log_var_phi)
             
             # phi
             if iter < 3:
-                phi = np.dot(var_phi, Elogbeta_doc).T
+                phi = np.dot(Eloggauss, var_phi.T)
                 (log_phi, log_norm) = utils.log_normalize(phi)
                 phi = np.exp(log_phi)
             else:
-                phi = np.dot(var_phi, Elogbeta_doc).T + Elogsticks_2nd
+                phi = np.dot(Eloggauss, var_phi.T) + Elogsticks_2nd
                 (log_phi, log_norm) = utils.log_normalize(phi)
                 phi = np.exp(log_phi)
 
             # v
-            phi_all = phi * np.array(doc.counts)[:,np.newaxis]
+            #phi_all = phi * np.array(doc.counts)[:,np.newaxis]
+            phi_all = phi[:, np.newaxis]
             v[0] = 1.0 + np.sum(phi_all[:,:self.m_K-1], 0)
             phi_cum = np.flipud(np.sum(phi_all[:,1:], 0))
             v[1] = self.m_alpha + np.flipud(np.cumsum(phi_cum))
@@ -288,7 +276,7 @@ class online_hdp:
             likelihood += np.sum((Elogsticks_2nd - log_phi) * phi)
 
             # X part, the data part
-            likelihood += np.sum(phi.T * np.dot(var_phi, Elogbeta_doc * doc.counts))
+            likelihood += np.sum(phi.T * np.dot(var_phi, Eloggauss.T))
 
             converge = (likelihood - old_likelihood)/abs(old_likelihood)
             old_likelihood = likelihood
@@ -339,6 +327,65 @@ class online_hdp:
         var_phi_sum = np.flipud(self.m_varphi_ss[1:])
         self.m_var_sticks[1] = np.flipud(np.cumsum(var_phi_sum)) + self.m_gamma
 
+    def expect_log_gauss(self, X):
+        ## TODO some const could be precomputed
+        log_lik = np.zeros(X.shape[0], self.m_T)
+        log_lik += -0.5 * self.m_T * np.log(2 * np.pi) - np.log(2 * np.pi * np.e)
+        log_lik += 0.5 * self.m_T * (digamma(self.m_dof) - np.log(self.m_scale))
+        for t in self.m_T:
+            cons = 0.5 * self.m_dof[t] / self.m_scale[t]
+            d = X - means[t]
+            log_lik[:, t] -= cons * (np.sum(d * d) + self.m_dim)
+        return log_lik
+        
+    def score_samples(self, X):
+        """Return the likelihood of the data under the model.
+
+        Compute the bound on log probability of X under the model
+        and return the posterior distribution (responsibilities) of
+        each mixture component for each element of X.
+
+        This is done by computing the parameters for the mean-field of
+        z for each observation.
+
+        Parameters
+        ----------
+        X : array_like, shape (n_samples, n_features)
+            List of n_features-dimensional data points.  Each row
+            corresponds to a single data point.
+
+        Returns
+        -------
+        logprob : array_like, shape (n_samples,)
+            Log probabilities of each data point in X
+        responsibilities: array_like, shape (n_samples, n_components)
+            Posterior probabilities of each mixture component for each
+            observation
+        """
+        X = np.asarray(X)
+        if X.ndim == 1:
+            X = X[:, np.newaxis]
+        z = np.zeros((X.shape[0], self.m_T))
+        sd = digamma(self.gamma_.T[1] + self.gamma_.T[2])
+        dgamma1 = digamma(self.gamma_.T[1]) - sd
+        dgamma2 = np.zeros(self.n_components)
+        dgamma2[0] = digamma(self.gamma_[0, 2]) - digamma(self.gamma_[0, 1] +
+                                                          self.gamma_[0, 2])
+        for j in range(1, self.n_components):
+            dgamma2[j] = dgamma2[j - 1] + digamma(self.gamma_[j - 1, 2])
+            dgamma2[j] -= sd[j - 1]
+        dgamma = dgamma1 + dgamma2
+        # Free memory and developers cognitive load:
+        del dgamma1, dgamma2, sd
+
+        p = _bound_state_log_lik(X, self._initial_bound + self.bound_prec_,
+                                 self.precs_, self.means_,
+                                 self.covariance_type)
+        z = p + dgamma
+        z = log_normalize(z, axis=-1)
+        bound = np.sum(z * p, axis=-1)
+        return bound, z
+
     def update_expectations(self):
         """
         Since we're doing lazy updates on lambda, at any given moment
@@ -355,26 +402,16 @@ class online_hdp:
         self.m_timestamp[:] = self.m_updatect
         self.m_status_up_to_date = True
 
-    def _update_means(self, X, z):
+    def update_means(self, X, z):
         """Update the variational distributions for the means"""
         n_features = X.shape[1]
         for k in range(self.n_components):
-            if self.covariance_type in ['spherical', 'diag']:
-                num = np.sum(z.T[k].reshape((-1, 1)) * X, axis=0)
-                num *= self.precs_[k]
-                den = 1. + self.precs_[k] * np.sum(z.T[k])
-                self.means_[k] = num / den
-            elif self.covariance_type in ['tied', 'full']:
-                if self.covariance_type == 'tied':
-                    cov = self.precs_
-                else:
-                    cov = self.precs_[k]
-                den = np.identity(n_features) + cov * np.sum(z.T[k])
-                num = np.sum(z.T[k].reshape((-1, 1)) * X, axis=0)
-                num = np.dot(cov, num)
-                self.means_[k] = linalg.lstsq(den, num)[0]
+            num = np.sum(z.T[k].reshape((-1, 1)) * X, axis=0)
+            num *= self.precs_[k]
+            den = 1. + self.precs_[k] * np.sum(z.T[k])
+            self.means_[k] = num / den
 
-    def _update_precisions(self, X, z):
+    def update_precisions(self, X, z):
         """Update the variational distributions for the precisions"""
         n_features = X.shape[1]
         self.dof_ = 0.5 * n_features * np.sum(z, axis=0)
